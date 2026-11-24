@@ -815,6 +815,8 @@ struct ShadersOptions {
     only: Option<String>,
     pipelines: bool,
     used_only: bool,
+    shard: Option<(usize, usize)>,
+    processes: Option<usize>,
     direct: bool,
     sample: usize,
     seed: u64,
@@ -850,6 +852,8 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         only: None,
         pipelines: false,
         used_only: false,
+        shard: None,
+        processes: None,
         direct: false,
         sample: 200,
         seed: 1,
@@ -888,6 +892,8 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--only" => opts.only = Some(p.value("--only")?.to_ascii_lowercase()),
             "--pipelines" => opts.pipelines = true,
             "--used-only" => opts.used_only = true,
+            "--shard" => opts.shard = Some(parse_shard(p.value("--shard")?).ok_or("--shard takes k/n with k < n")?),
+            "--processes" => opts.processes = Some(p.parse_usize("--processes")?),
             "--direct" => opts.direct = true,
             "--sample" => opts.sample = p.parse_usize("--sample")?,
             "--seed" => opts.seed = p.parse_u64("--seed")?,
@@ -929,6 +935,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let _ = EXAMPLE_FOR.set(m.clone());
     }
     let t0 = std::time::Instant::now();
+    if let Some(n) = opts.processes.filter(|&n| n > 1 && opts.shard.is_none() && opts.precompile) {
+        return precompile_in_processes(path, args, n, t0);
+    }
 
     let (input, what) = if path.is_dir() {
         let mut files = Vec::new();
@@ -981,7 +990,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let used = opts.used_only.then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), t0);
+        return precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), opts.shard, t0);
     }
     if opts.direct {
         return direct_sweep(&input, &opts, t0);
@@ -1182,6 +1191,75 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
         times[times.len() - 1]
     );
     Ok(())
+}
+
+/// `--shard k/n`: this process takes records k, k + n, k + 2n, …
+fn parse_shard(v: &str) -> Option<(usize, usize)> {
+    let (k, n) = v.split_once('/')?;
+    let (k, n) = (k.trim().parse().ok()?, n.trim().parse::<usize>().ok()?);
+    (n > 0 && k < n).then_some((k, n))
+}
+
+/// The arguments of process `k` of `n`: the caller's, without `--processes N`, with `--shard k/n`.
+fn shard_args(args: &[String], k: usize, n: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--processes" {
+            i += 2;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out.push("--shard".into());
+    out.push(format!("{k}/{n}"));
+    out
+}
+
+/// `--precompile --processes N`: N processes of this program, each with `--shard k/N`, sharing
+/// the DXIL and driver-blob caches. NVIDIA's driver builds about one pipeline at a time in a
+/// process however many threads ask (an RTX 4090: 2 threads busy, 28 % CPU with 12 pipeline
+/// threads; four processes made ~3.7× the pipelines). Each gets its share of the DXC threads
+/// and 2 pipeline threads unless `XCL_DXC_THREADS` / `XCL_PIPELINE_THREADS` say otherwise.
+/// Returns the first failing process's code (0: all finished).
+fn precompile_in_processes(path: &Path, args: &[String], n: usize, t0: std::time::Instant) -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("xcl shaders --processes: {e}");
+            return 2;
+        }
+    };
+    let dxc = (recomp::dxc::compile_threads() / n).max(1).to_string();
+    println!("precompiling in {n} processes ({dxc} DXC threads each)");
+    let mut children = Vec::new();
+    for k in 0..n {
+        let mut c = std::process::Command::new(&exe);
+        c.arg("shaders").arg(path).args(shard_args(args, k, n));
+        if std::env::var_os("XCL_DXC_THREADS").is_none() {
+            c.env("XCL_DXC_THREADS", &dxc);
+        }
+        if std::env::var_os("XCL_PIPELINE_THREADS").is_none() {
+            c.env("XCL_PIPELINE_THREADS", "2");
+        }
+        match c.spawn() {
+            Ok(ch) => children.push((k, ch)),
+            Err(e) => eprintln!("xcl shaders --processes: process {k}: {e}"),
+        }
+    }
+    let mut code = if children.len() == n { 0 } else { 2 };
+    for (k, mut ch) in children {
+        let c = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+        if c != 0 {
+            eprintln!("xcl shaders --processes: process {k} of {n} ended with {c}");
+            if code == 0 {
+                code = c;
+            }
+        }
+    }
+    println!("{n} processes done ({:.0} s)", t0.elapsed().as_secs_f64());
+    code
 }
 
 /// `--precompile`: translate every VS / PS / MS / CS program and compile it into the DXIL cache
@@ -1590,7 +1668,7 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
     used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, shard: Option<(usize, usize)>, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -1620,12 +1698,13 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
     println!(
-        "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
+        "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{}{})",
         recomp::dxc::cache_dir().display(),
         recomp::dxc::compile_threads(),
         windows & !recomp::HEAP_WINDOWS,
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
-        if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
+        if split { ", split wave64 for a GPU with 32-lane waves" } else { "" },
+        shard.map_or(String::new(), |(k, m)| format!("; records {k}, {k} + {m}, … (--shard {k}/{m})"))
     );
     std::thread::scope(|s| {
         for _ in 0..threads {
@@ -1633,6 +1712,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
+                }
+                // another process's record (`--shard`)
+                if shard.is_some_and(|(k, m)| i % m != k) {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
@@ -2190,6 +2274,22 @@ mod tests {
             // no DXC, a WARP-only or cacheless device, cache control without Developer Mode
             Err(MeasureError::Unavailable(e)) => recomp::runner::skip_test(&e),
             Err(MeasureError::Failed(e)) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn shards_split_the_records_and_drop_processes() {
+        assert_eq!(parse_shard("1/4"), Some((1, 4)));
+        assert_eq!(parse_shard(" 0 / 2 "), Some((0, 2)));
+        assert_eq!(parse_shard("4/4"), None);
+        assert_eq!(parse_shard("0/0"), None);
+        assert_eq!(parse_shard("x"), None);
+        let args: Vec<String> = ["--precompile", "--processes", "3", "--only", "cs", "--pipelines"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(shard_args(&args, 2, 3), ["--precompile", "--only", "cs", "--pipelines", "--shard", "2/3"]);
+        // every record in exactly one shard
+        let n = 3;
+        for i in 0..20 {
+            assert_eq!((0..n).filter(|&k| i % n == k).count(), 1);
         }
     }
 
