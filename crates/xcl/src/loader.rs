@@ -230,8 +230,9 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     for s in pe.sections.iter().filter(|s| s.characteristics & 0x2000_0000 != 0) {
         let len = (s.mapped_size() as usize).min(size.saturating_sub(s.va as usize));
         unsafe { crate::eh::hook_gs_failure(base + s.va as usize, len, &name) };
-        // 9. a title's CLZERO loops on a CPU without CLZERO: native code in their place
-        if !crate::eh::cpu_has_clzero() {
+        // 9. a title's CLZERO loops on a CPU without CLZERO: patched here only with
+        // XCL_CLZERO_PATCH=eager; by default each at its first fault (`eh::patch_clzero_site`)
+        if !crate::eh::cpu_has_clzero() && crate::eh::clzero_patch_mode() == crate::eh::ClzeroPatch::Eager {
             unsafe { crate::eh::patch_clzero_loops(base + s.va as usize, len, &name) };
         }
     }

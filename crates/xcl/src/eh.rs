@@ -5,6 +5,13 @@
 //!   catch matching code use it to find the image base of the thrower's `ThrowInfo`;
 //!   the real function only knows modules on the Windows loader list.
 //! * An unhandled-exception filter logs crashes with module+RVA and writes the report.
+//!
+//! Provenance: the CLZERO loop patch at the faulting site (`patch_clzero_site`) and the atomic
+//! 16-byte code write (`patch_atomic`) are ported from Vice-Tay,
+//! <https://github.com/TaynanGT/Vice-Tay>, `crates/victory-loader/src/console_insn.rs`, commit
+//! 1f69d67 (GPL-3.0-or-later), on 2026-11-27: a loop is patched at its first fault, with one
+//! `cmpxchg16b` on the aligned 16 bytes around it. The stand-in, the counters and the rest are
+//! XCL's own. Copyright of the ported parts stays with their authors (Vice-Tay's `docs/credits.md`).
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -203,13 +210,14 @@ pub fn cpu_has_clzero() -> bool {
     })
 }
 
-/// The code of a CLZERO loop's stand-in for a CPU without CLZERO, entered by a `call` in the
-/// loop's place: `[rax & !63 .. )` zeroed in whole lines up to `end_reg`, at least one line, rax
-/// and the flags left as the loop's last `add rax, 0x40; cmp rax, <end_reg>` leaves them. No
-/// other register changes.
+/// The code of a CLZERO loop's stand-in for a CPU without CLZERO, entered by a `call` (5 bytes) in
+/// the loop's place that returns to the loop's end (12 bytes on): `[rax & !63 .. )` zeroed in
+/// whole lines up to `end_reg`, at least one line, rax and the flags left as the loop's last
+/// `add rax, 0x40; cmp rax, <end_reg>` leaves them. No other register changes.
 fn clzero_loop_thunk(end_reg: u8) -> Vec<u8> {
     let r = end_reg & 15;
-    let mut c: Vec<u8> = vec![0x57, 0x51, 0x50]; // push rdi; push rcx; push rax
+    let mut c: Vec<u8> = vec![0x48, 0x83, 0x04, 0x24, 0x07]; // add qword [rsp], 7 (the return address: past the loop's 12 bytes)
+    c.extend_from_slice(&[0x57, 0x51, 0x50]); // push rdi; push rcx; push rax
     c.extend_from_slice(&[0x48 | (r >> 3), 0x8B, 0xC8 | (r & 7)]); // mov rcx, <end_reg>
     c.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
     c.extend_from_slice(&[0x48, 0x83, 0xE7, 0xC0]); // and rdi, -64
@@ -244,63 +252,169 @@ unsafe fn code_near(site: usize) -> Option<usize> {
     None
 }
 
-/// Executable memory `[at, at + len)` of a title image on a CPU without CLZERO: each
-/// `clzero; add rax, 0x40; cmp rax, <reg>; jb` loop (`insn::ConsoleOnly::ClzeroLoop`, 12 bytes)
-/// becomes a call of a stand-in that zeroes the same lines (`clzero_loop_thunk`).
-/// `XCL_CLZERO_PATCH=0` leaves the loops as they are. The patched loops.
+/// `XCL_CLZERO_PATCH`: what a CPU without CLZERO does with a title's CLZERO loops. 0: nothing
+/// (every run of a loop is an exception, emulated), `eager`: all of them at image mapping
+/// (`patch_clzero_loops`), else (the default): each at its first fault (`patch_clzero_site`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ClzeroPatch {
+    Off,
+    Lazy,
+    Eager,
+}
+
+pub fn clzero_patch_mode() -> ClzeroPatch {
+    static MODE: std::sync::OnceLock<ClzeroPatch> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("XCL_CLZERO_PATCH") {
+        Ok(v) if v.trim() == "0" => ClzeroPatch::Off,
+        Ok(v) if v.trim().eq_ignore_ascii_case("eager") => ClzeroPatch::Eager,
+        _ => ClzeroPatch::Lazy,
+    })
+}
+
+/// Loop sites patched, and loop faults emulated, since the start.
+static CLZERO_PATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLZERO_FAULTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The CLZERO counters for a log line (None before the first loop fault or patch).
+fn clzero_summary() -> Option<String> {
+    let (p, f) = (CLZERO_PATCHED.load(Ordering::Relaxed), CLZERO_FAULTS.load(Ordering::Relaxed));
+    (p + f != 0).then(|| format!("CLZERO: {p} loop sites patched at their first fault, {f} faults emulated"))
+}
+
+/// Stand-ins in executable memory a `call rel32` reaches: 64 KiB at a time, and where each end
+/// register's stand-in is in it.
+struct ThunkArena {
+    base: usize,
+    used: usize,
+    thunks: [usize; 16],
+}
+
+static THUNKS: Mutex<Vec<ThunkArena>> = Mutex::new(Vec::new());
+
+/// The stand-in for a loop to `end_reg` that a `call rel32` at `site` reaches (made on the first
+/// ask, in an arena already there or a new one). The same one for the same site every time.
+unsafe fn clzero_thunk_near(site: usize, end_reg: u8) -> Option<usize> {
+    let mut arenas = THUNKS.lock().unwrap_or_else(|e| e.into_inner());
+    let t = clzero_loop_thunk(end_reg);
+    let r = end_reg as usize & 15;
+    for a in arenas.iter_mut().filter(|a| a.base.abs_diff(site) < 0x7000_0000) {
+        if a.thunks[r] == 0 && a.used + t.len() <= 0x1_0000 {
+            std::ptr::copy_nonoverlapping(t.as_ptr(), (a.base + a.used) as *mut u8, t.len());
+            a.thunks[r] = a.base + a.used;
+            a.used += (t.len() + 15) & !15;
+        }
+        if a.thunks[r] != 0 {
+            return Some(a.thunks[r]);
+        }
+    }
+    let base = code_near(site)?;
+    std::ptr::copy_nonoverlapping(t.as_ptr(), base as *mut u8, t.len());
+    let mut thunks = [0; 16];
+    thunks[r] = base;
+    arenas.push(ThunkArena { base, used: (t.len() + 15) & !15, thunks });
+    Some(base)
+}
+
+/// Whether `target` is in one of the stand-ins' arenas.
+fn is_clzero_thunk(target: usize) -> bool {
+    THUNKS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|a| (a.base..a.base + 0x1_0000).contains(&target))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Patched {
+    /// by this call
+    Now,
+    /// the bytes were the patch already (another thread's, or an earlier call's)
+    Already,
+    /// not: other bytes there, the bytes cross 16 aligned ones, or the page cannot be written
+    No,
+}
+
+/// One thread at a time changes code: a second one would take the first one's loosened page
+/// protection for the page's own.
+static PATCHING: Mutex<()> = Mutex::new(());
+
+/// Replaces the bytes at `at`, which are `was`, by `new` in one store that other threads see
+/// whole: a `cmpxchg16b` on the aligned 16 bytes around them, so that no thread fetches half of
+/// the new instruction. Refused where they cross 16 aligned bytes. The page is made writable
+/// for the store and put back, and the processor's instruction cache is flushed.
 ///
-/// Left alone, every run of such a loop is an illegal-instruction exception that
-/// `emulate_console_only` answers: a retail title's memset is such a loop, and while its world
-/// loaded one of its threads was in that exception at every look (thread dumps at 300, 360 and
-/// 400 s of several runs on an Intel CPU), with the GPU measured at 0.2 to 0.5 s of work in world
-/// frames of 17 to 43 s.
-pub unsafe fn patch_clzero_loops(at: usize, len: usize, image: &str) -> usize {
+/// Ported from Vice-Tay (`console_insn.rs`, see the header), as a function of slices.
+///
+/// # Safety
+/// `at` is in code that stays mapped, and `new` does for it what `was` does.
+unsafe fn patch_atomic(at: usize, was: &[u8], new: &[u8]) -> Patched {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
-    if len < 12 || std::env::var("XCL_CLZERO_PATCH").is_ok_and(|v| v.trim() == "0") {
-        return 0;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let off = at & 15;
+    if was.len() != new.len() || off + new.len() > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
+        return Patched::No;
     }
-    let code = std::slice::from_raw_parts(at as *const u8, len);
-    let sites: Vec<(usize, u8)> = (0..len - 11)
-        .filter(|&i| code[i] == 0x0F && code[i + 1] == 0x01 && code[i + 2] == 0xFC && (i == 0 || code[i - 1] != 0x67))
-        .filter_map(|i| match crate::insn::decode(&code[i..i + 12]) {
-            // (rsp is no end of a loop: the stand-in's pushes move it)
-            Some((crate::insn::ConsoleOnly::ClzeroLoop { end_reg }, 12)) if end_reg != 4 => Some((i, end_reg)),
-            _ => None,
-        })
-        .collect();
-    if sites.is_empty() {
-        return 0;
+    let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+    let word = (at & !15) as *mut u128;
+    let mut old = 0u32;
+    if VirtualProtect(word.cast(), 16, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        return Patched::No;
     }
-    let Some(arena) = code_near(at + len) else {
-        crate::xlog_warn!("{image}: {} CLZERO loops stay emulated (no executable memory near the image)", sites.len());
-        return 0;
+    // what is there (zeros are replaced by zeros)
+    let mut now = std::arch::x86_64::cmpxchg16b(word, 0, 0, SeqCst, SeqCst);
+    let done = loop {
+        let mut bytes = now.to_le_bytes();
+        if bytes[off..off + new.len()] == *new {
+            break Patched::Already;
+        }
+        if bytes[off..off + was.len()] != *was {
+            break Patched::No;
+        }
+        bytes[off..off + new.len()].copy_from_slice(new);
+        let there = std::arch::x86_64::cmpxchg16b(word, now, u128::from_le_bytes(bytes), SeqCst, SeqCst);
+        if there == now {
+            break Patched::Now;
+        }
+        now = there; // another bytes of the 16 changed meanwhile: look again
     };
-    // one stand-in for each end register
-    let mut thunks = [0usize; 16];
-    let mut next = arena;
-    let mut done = 0;
-    for &(i, reg) in &sites {
-        if thunks[reg as usize] == 0 {
-            let t = clzero_loop_thunk(reg);
-            std::ptr::copy_nonoverlapping(t.as_ptr(), next as *mut u8, t.len());
-            thunks[reg as usize] = next;
-            next += (t.len() + 15) & !15;
-        }
-        let site = at + i;
-        let Ok(rel) = i32::try_from(thunks[reg as usize] as i64 - (site as i64 + 5)) else { continue };
-        let mut patch = [0xE8u8, 0, 0, 0, 0, 0x0F, 0x1F, 0x80, 0, 0, 0, 0]; // call thunk; nop (7 bytes)
-        patch[1..5].copy_from_slice(&rel.to_le_bytes());
-        let mut old = 0u32;
-        if VirtualProtect(site as *const std::ffi::c_void, 12, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
-            continue;
-        }
-        std::ptr::copy_nonoverlapping(patch.as_ptr(), site as *mut u8, 12);
-        VirtualProtect(site as *const std::ffi::c_void, 12, old, &mut old);
-        done += 1;
+    VirtualProtect(word.cast(), 16, old, &mut old);
+    FlushInstructionCache(GetCurrentProcess(), word.cast(), 16);
+    done
+}
+
+/// The CLZERO loop at `site` (`clzero; add rax, 0x40; cmp rax, <end_reg>; jb`, 12 bytes, found
+/// by `insn::decode`) becomes a `call` of its stand-in (`clzero_loop_thunk`) that returns after
+/// the loop: its first 5 bytes, written by `patch_atomic`. The 7 that stay are never run: no
+/// thread is inside the loop (the exception handler emulates it whole), and the call skips them.
+/// Not patched: a loop to rsp (the stand-in's pushes move it) and one that crosses 16 aligned
+/// bytes; those stay emulated.
+unsafe fn patch_clzero_site(site: usize, end_reg: u8) -> Patched {
+    if end_reg == 4 || (site & 15) + 5 > 16 {
+        return Patched::No;
     }
+    let Some(thunk) = clzero_thunk_near(site, end_reg) else { return Patched::No };
+    let Ok(rel) = i32::try_from(thunk as i64 - (site as i64 + 5)) else { return Patched::No };
+    let mut call = [0xE8u8, 0, 0, 0, 0];
+    call[1..].copy_from_slice(&rel.to_le_bytes());
+    let done = patch_atomic(site, &[0x0F, 0x01, 0xFC, 0x48, 0x83], &call);
+    if done == Patched::Now && CLZERO_PATCHED.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_info!("CLZERO: the first loop site is patched: its later runs are native code (XCL_CLZERO_PATCH=0: emulated at every run)");
+    }
+    done
+}
+
+/// Executable memory `[at, at + len)` of a title image, with `XCL_CLZERO_PATCH=eager`: every
+/// CLZERO loop in it (`insn::ConsoleOnly::ClzeroLoop`, 12 bytes) is patched (`patch_clzero_site`)
+/// at once, whether it ever runs or not. The patched loops.
+pub unsafe fn patch_clzero_loops(at: usize, len: usize, image: &str) -> usize {
+    let code = std::slice::from_raw_parts(at as *const u8, len);
+    let done = (0..len.saturating_sub(11))
+        .filter(|&i| code[i] == 0x0F && code[i + 1] == 0x01 && code[i + 2] == 0xFC && (i == 0 || code[i - 1] != 0x67))
+        .filter(|&i| match crate::insn::decode(&code[i..i + 12]) {
+            Some((crate::insn::ConsoleOnly::ClzeroLoop { end_reg }, 12)) => patch_clzero_site(at + i, end_reg) == Patched::Now,
+            _ => false,
+        })
+        .count();
     if done != 0 {
-        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(windows_sys::Win32::System::Threading::GetCurrentProcess(), at as *const std::ffi::c_void, len);
-        crate::xlog_info!("{image}: {done} CLZERO loops run as native code on this CPU, which has no CLZERO (XCL_CLZERO_PATCH=0: emulated, one exception a loop)");
+        crate::xlog_info!("{image}: {done} CLZERO loops patched at image mapping (XCL_CLZERO_PATCH=eager)");
     }
     done
 }
@@ -448,6 +562,12 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     let n = code_bytes_at(rip, 16);
     let code = std::slice::from_raw_parts(rip as *const u8, n);
     let Some((what, len)) = crate::insn::decode(code) else {
+        // a loop another thread patched after this one faulted on it: run it again, as the call
+        if let [0xE8, a, b, c, d, ..] = *code {
+            if is_clzero_thunk((rip as i64 + 5 + i32::from_le_bytes([a, b, c, d]) as i64) as usize) {
+                return -1;
+            }
+        }
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
         return 0;
     };
@@ -513,12 +633,23 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                     ctx.EFlags = cmp_eflags(ctx.EFlags, final_rax, end);
                 }
                 _ if is_writable(line, 64) => {
-                    // Fall back to stepping the single `clzero` (len - 9) so the title's own
-                    // `add / cmp / jb` runs natively for end <= start, huge/wrapping, or partial ranges.
+                    // end <= start, huge/wrapping or partial ranges: one pass of the loop (one
+                    // line, `add rax, 0x40; cmp rax, end`), then on past it or, with `jb` taken,
+                    // the next pass faults again. No thread is ever inside the loop's later
+                    // instructions, so `patch_clzero_site` may overwrite them.
                     std::ptr::write_bytes(line as *mut u8, 0, 64);
-                    step = len - 9;
+                    ctx.Rax = start.wrapping_add(64);
+                    ctx.EFlags = cmp_eflags(ctx.EFlags, ctx.Rax, end);
+                    if ctx.Rax < end {
+                        step = 0;
+                    }
                 }
                 _ => return 0,
+            }
+            CLZERO_FAULTS.fetch_add(1, Ordering::Relaxed);
+            // the first fault at a site patches it (a loop of 12 bytes: no prefix before it)
+            if len == 12 && clzero_patch_mode() == ClzeroPatch::Lazy {
+                patch_clzero_site(rip, end_reg);
             }
         }
         ConsoleOnly::Rdpru => {
@@ -818,6 +949,9 @@ pub fn dump_threads() {
             ok = Thread32Next(snap, &mut te) != 0;
         }
         CloseHandle(snap);
+        if let Some(s) = clzero_summary() {
+            crate::xlog_info!("{s}");
+        }
         crate::xlog_info!("thread dump ({} threads):
 {}", lines.len(), lines.join("
 "));
@@ -1184,7 +1318,8 @@ mod tests {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), code, bytes.len());
             assert_eq!(patch_clzero_loops(code as usize, bytes.len(), "test"), 1);
             assert_eq!(*code, 0xE8, "a call in the loop's place");
-            let run = |start: usize, end: usize| -> (usize, usize, usize, usize) {
+            assert_eq!(std::slice::from_raw_parts(code.add(5), 11), &bytes[5..], "only its first 5 bytes are written");
+            let run =|start: usize, end: usize| -> (usize, usize, usize, usize) {
                 let (rax, rcx, rdi, rdx): (usize, usize, usize, usize);
                 std::arch::asm!("call {f}", f = in(reg) code, inout("rax") start => rax, in("r10") end, inout("rcx") 0xAA00usize => rcx, inout("rdi") 0x1111usize => rdi, inout("rdx") 0x2222usize => rdx);
                 (rax, rcx, rdi, rdx)
@@ -1205,6 +1340,107 @@ mod tests {
             let (rax, _, _, _) = run(base + 64 * 2, base + 64);
             assert_eq!(rax, base + 64 * 3);
             assert!(m.0[..64 * 2].iter().all(|&b| b == 0xEE) && m.0[64 * 2..64 * 3].iter().all(|&b| b == 0) && m.0[64 * 3..].iter().all(|&b| b == 0xEE));
+        }
+    }
+
+    /// The atomic write (`patch_atomic`) on a synthetic page of code that is not writable: only the
+    /// bytes asked for change, whatever their place in the 16 aligned ones, a second write of the
+    /// same is a no-op, bytes that are not the expected ones and bytes over the end of the 16 are
+    /// refused, and the page protection is as it was.
+    #[test]
+    fn the_atomic_code_patch_changes_only_its_bytes_and_keeps_the_page_protection() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
+        };
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(page, 0);
+            let (was, new) = ([0x0Fu8, 0x01, 0xFC, 0x48, 0x83], [0xE8u8, 1, 2, 3, 4]);
+            let fill: Vec<u8> = (0..32u8).map(|i| 0xA0 + i).collect();
+            for off in [0usize, 3, 11, 16, 27] {
+                std::ptr::copy_nonoverlapping(fill.as_ptr(), page as *mut u8, 32);
+                std::ptr::copy_nonoverlapping(was.as_ptr(), (page + off) as *mut u8, 5);
+                let mut old = 0;
+                VirtualProtect(page as *const _, 0x1000, PAGE_EXECUTE_READ, &mut old);
+                let mut want = fill.clone();
+                want[off..off + 5].copy_from_slice(&new);
+                assert_eq!(patch_atomic(page + off, &was, &new), Patched::Now, "offset {off}");
+                assert_eq!(std::slice::from_raw_parts(page as *const u8, 32), &want[..], "offset {off}: the 5 bytes, nothing else");
+                assert_eq!(patch_atomic(page + off, &was, &new), Patched::Already, "offset {off}: twice");
+                assert_eq!(std::slice::from_raw_parts(page as *const u8, 32), &want[..], "offset {off}: twice changes nothing");
+                assert_eq!(patch_atomic(page + off, &[0u8; 5], &[1u8; 5]), Patched::No, "offset {off}: other bytes than expected");
+                let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                VirtualQuery(page as *const _, &mut m, std::mem::size_of_val(&m));
+                assert_eq!(m.Protect, PAGE_EXECUTE_READ, "offset {off}: protection put back");
+                VirtualProtect(page as *const _, 0x1000, PAGE_READWRITE, &mut old);
+            }
+            // over the end of its 16 aligned bytes: refused, nothing written
+            for off in [12usize, 15, 28] {
+                std::ptr::copy_nonoverlapping(fill.as_ptr(), page as *mut u8, 32);
+                std::ptr::copy_nonoverlapping(was.as_ptr(), (page + off) as *mut u8, 5);
+                let before = std::slice::from_raw_parts(page as *const u8, 32).to_vec();
+                assert_eq!(patch_atomic(page + off, &was, &new), Patched::No, "offset {off}");
+                assert_eq!(std::slice::from_raw_parts(page as *const u8, 32), &before[..], "offset {off}: untouched");
+            }
+            VirtualFree(page as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A CLZERO loop patched at its fault (`patch_clzero_site`): the first 5 bytes are a call of a
+    /// stand-in, the rest of the 16 aligned bytes is as it was, a second patch changes nothing, a
+    /// loop over the end of its 16 aligned bytes or to rsp stays as it is, and the patched loop
+    /// runs as native code and leaves rax and the flags as the loop does.
+    #[test]
+    fn a_clzero_loop_patched_at_its_fault_runs_native_and_is_patched_once() {
+        unsafe {
+            let code = crate::stubs::alloc_code(96);
+            let loop_bytes = [0x0Fu8, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4]; // to r10
+            let tail = [0x0Fu8, 0x92, 0xC1, 0xC3]; // setb cl; ret
+            let put = |off: usize| {
+                std::ptr::write_bytes(code, 0x90, 96);
+                std::ptr::copy_nonoverlapping(loop_bytes.as_ptr(), code.add(off), 12);
+                std::ptr::copy_nonoverlapping(tail.as_ptr(), code.add(off + 12), 4);
+            };
+            // offset 11 of the 16: the 5 bytes end at the end of them
+            put(11);
+            let site = code as usize + 11;
+            let before = std::slice::from_raw_parts(code, 32).to_vec();
+            assert_eq!(patch_clzero_site(site, 10), Patched::Now);
+            let now = std::slice::from_raw_parts(code, 32).to_vec();
+            assert_eq!(now[11], 0xE8);
+            let target = (site as i64 + 5 + i32::from_le_bytes(now[12..16].try_into().unwrap()) as i64) as usize;
+            assert!(is_clzero_thunk(target), "the call goes to a stand-in");
+            assert_eq!(&now[..11], &before[..11]);
+            assert_eq!(&now[16..], &before[16..], "nothing past the 16 aligned bytes");
+            assert_eq!(patch_clzero_site(site, 10), Patched::Already);
+            assert_eq!(std::slice::from_raw_parts(code, 32), &now[..], "patching twice changes nothing");
+            // a thread that faulted on the loop before it was patched meets the call: run again
+            modules::register_mapped(std::sync::Arc::new(modules::MappedModule {
+                name: "clzero_site.exe".into(), path: "clzero_site.exe".into(), base: code as usize, size: 96, entry_rva: 0, is_dll: false,
+                exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: std::sync::atomic::AtomicBool::new(false),
+                initialized: std::sync::atomic::AtomicBool::new(true), stack_reserve: 0,
+            }));
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            ctx.Rip = site as u64;
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, site as u64, "not stepped over");
+            modules::unregister_mapped(code as usize);
+            // it runs: from the middle of line 1 to the middle of line 3, rax at the end, cf clear
+            #[repr(align(64))]
+            struct Lines([u8; 64 * 5]);
+            let mut m = Lines([0xEE; 64 * 5]);
+            let base = m.0.as_mut_ptr() as usize;
+            let (rax, rcx): (usize, usize);
+            std::arch::asm!("call {f}", f = in(reg) site, inout("rax") base + 64 + 8 => rax, in("r10") base + 64 * 3 + 8, inout("rcx") 0xAA00usize => rcx);
+            assert_eq!((rax, rcx), (base + 64 * 3 + 8, 0xAA00));
+            assert!(m.0[..64].iter().all(|&b| b == 0xEE) && m.0[64..64 * 3].iter().all(|&b| b == 0) && m.0[64 * 3..].iter().all(|&b| b == 0xEE));
+            // over the end of the 16 aligned bytes (offset 13), and to rsp: not patched, not changed
+            put(13);
+            assert_eq!(patch_clzero_site(code as usize + 13, 10), Patched::No);
+            assert_eq!(std::slice::from_raw_parts(code.add(13), 12), &loop_bytes[..], "the loop over the end is as it was");
+            put(0);
+            assert_eq!(patch_clzero_site(code as usize, 4), Patched::No);
+            assert_eq!(std::slice::from_raw_parts(code, 12), &loop_bytes[..], "the loop to rsp is as it was");
         }
     }
 
@@ -1238,8 +1474,12 @@ mod tests {
             assert!(s[..0x40].iter().all(|&b| b == 0xA5));
             assert!(s[0x40..0x100].iter().all(|&b| b == 0));
             assert!(s[0x100..0x140].iter().all(|&b| b == 0xA5));
+            // the first fault patched the loop (a call), unless XCL_CLZERO_PATCH says not
+            assert_eq!(*(code as *const u8) == 0xE8, clzero_patch_mode() == ClzeroPatch::Lazy);
+            let reset = || std::ptr::copy_nonoverlapping(loop_bytes.as_ptr(), code as *mut u8, loop_bytes.len());
 
             // 2) Unaligned start + non-64B-multiple length: start = +0x50, end = +0xC0 -> 2 cache lines [0x40..0xC0), Rax -> +0xD0, ZF=0, CF=0
+            reset();
             std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
             ctx = std::mem::zeroed();
             (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x50) as u64, (buf + 0xC0) as u64, 0x202 | 0x041);
@@ -1252,19 +1492,30 @@ mod tests {
             assert!(s[0x40..0xC0].iter().all(|&b| b == 0));
             assert!(s[0xC0..0x140].iter().all(|&b| b == 0xA5));
 
-            // 3) end <= start: executes the single first clzero line [0x40..0x80) and steps only 3 bytes so add/cmp/jb runs natively
+            // 3) end <= start: the loop's single pass is done here, whole (the line [0x40..0x80), rax + 0x40, the
+            // flags of the cmp) and execution goes on past the loop: no thread is left inside its later instructions
             for end in [buf + 0x40, buf] {
+                reset();
                 std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
                 ctx = std::mem::zeroed();
                 (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x53) as u64, end as u64, 0x202);
                 assert_eq!(emulate_console_only(&mut ctx), -1);
-                assert_eq!(ctx.Rip, code as u64 + 3);
-                assert_eq!(ctx.Rax, (buf + 0x53) as u64);
+                assert_eq!(ctx.Rip, code as u64 + 12);
+                assert_eq!(ctx.Rax, (buf + 0x93) as u64);
+                assert_eq!(ctx.EFlags, cmp_eflags(0x202, (buf + 0x93) as u64, end as u64));
                 let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
                 assert!(s[..0x40].iter().all(|&b| b == 0xA5));
                 assert!(s[0x40..0x80].iter().all(|&b| b == 0));
                 assert!(s[0x80..0x140].iter().all(|&b| b == 0xA5));
             }
+            // a pass that ends below the end (rax wrapped): `jb` is taken, the loop's first instruction runs again
+            reset();
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
+            ctx = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, buf as u64 + 0x53, buf as u64 + 0x4000_0000_0000, 0x202);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, code as u64);
+            assert_eq!(ctx.Rax, (buf + 0x93) as u64);
         }
         modules::unregister_mapped(code);
         unsafe {
