@@ -173,6 +173,10 @@ pub fn write_final(crash: Option<String>) {
     crate::hle::kbm::release();
     // `XCL_DIRECT_DXIL_STATS=1`: the direct DXIL translator's live fallback summary
     crate::gpu::dxil::coverage::dump_fallbacks();
+    // `XCL_PSO_LIBRARY=1`: the pipeline library is saved (not after a crash: the device may be gone)
+    if crash.is_none() {
+        crate::hle::d3d12x::pipeline_library::save_at_exit();
+    }
     // a crash is kept even while another thread writes the report, and is written once that
     // thread is done – the process ends right after (#106); other calls give way at once
     let wait = if crash.is_some() { Duration::from_secs(2) } else { Duration::ZERO };

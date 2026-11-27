@@ -4255,6 +4255,39 @@ unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *co
     hr
 }
 
+/// `CreatePipelineLibrary` of the PC device `dev` (an adopted object: the original method, not the
+/// one `dev_create_pipeline_library` gives the title), for `pipeline_library`. No bytes: an empty
+/// library.
+unsafe fn create_pipeline_library(dev: *mut c_void, bytes: Option<&[u8]>) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    type F = unsafe extern "system" fn(*mut c_void, *const c_void, usize, *const GUID, *mut *mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(dev, slot_of(dev, "CreatePipelineLibrary")));
+    let (data, len) = bytes.map_or((std::ptr::null(), 0), |b| (b.as_ptr().cast(), b.len()));
+    let mut out = std::ptr::null_mut();
+    let hr = f(dev, data, len, &ID3D12PipelineLibrary1::IID as *const _ as *const GUID, &mut out);
+    if hr < 0 || out.is_null() {
+        return Err(windows::core::HRESULT(hr).into());
+    }
+    Ok(ID3D12PipelineLibrary1::from_raw(out))
+}
+
+/// `f` with the pipeline `obj`, made here and not yet the title's, as the D3D12 runtime made it
+/// (its own vtable, not XCL's): the runtime's `StorePipeline` takes the object it is given.
+unsafe fn with_native_vtable<R>(obj: *mut c_void, f: impl FnOnce() -> R) -> R {
+    let ext = vt(obj) as usize;
+    if !is_ext(ext) {
+        return f();
+    }
+    *(obj as *mut usize) = *vt(obj).sub(1);
+    let r = f();
+    *(obj as *mut usize) = ext;
+    r
+}
+
+/// Whether `rs`, a root signature of `abi_rs_for`, has static samplers.
+fn abi_rs_has_samplers(rs: *mut c_void) -> bool {
+    ABI_RS_SAMPLERS.lock().unwrap().as_ref().is_some_and(|m| m.values().any(|&r| r == rs as usize))
+}
+
 thread_local! {
     /// the driver ran out of memory on a pipeline with heap windows (`with_switch_fallback`)
     static HEAP_WINDOW_OOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -5106,6 +5139,33 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    // `XCL_PSO_LIBRARY=1`: a huge program is looked up in the pipeline library first
+    // (`pipeline_library`); one it has is loaded in milliseconds where a driver blob takes as long
+    // as a compile, one it lacks is made below and stored. Not the chain's pieces, and not a root
+    // signature with static samplers (NVIDIA restores those from the storing process's order).
+    let library = if super::pipeline_library::enabled() && mode != ComputeBuild::Chain && dxil.len() >= huge_pso_bytes()
+        && !ppv.is_null() && !abi_rs_has_samplers(rs)
+    {
+        super::pipeline_library::global(|bytes| create_pipeline_library(this, bytes))
+            .map(|library| (library, super::pipeline_library::entry_name(dxil, copy.Flags.0, false)))
+    } else {
+        None
+    };
+    if let Some((library, library_name)) = &library {
+        let began = std::time::Instant::now();
+        // (as `finish_pso`: the driver's time is not the title's)
+        let loaded = {
+            let _in_pc = (!super::pso_async::building_here()).then(super::pso_async::pc_call);
+            library.load(library_name, &copy)
+        };
+        if let Some(pso) = loaded {
+            *ppv = pso.into_raw();
+            adopt(*ppv, Kind::PipelineState);
+            let took = began.elapsed();
+            crate::xlog_info!("D3D12.X: compute PSO {library_name} ({} B DXIL) from the pipeline library, {} ms", dxil.len(), took.as_millis());
+            return (S_OK, took, false);
+        }
+    }
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
@@ -5157,6 +5217,21 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         }
     } else if reused && from_disk {
         driver_cache::note(true, None);
+    }
+    // … and what the library lacked is stored, for the next run
+    if let Some((library, library_name)) = &library {
+        if hr >= 0 && !(*ppv).is_null() {
+            if let Some(pso) = ID3D12PipelineState::from_raw_borrowed(&*ppv) {
+                let began = std::time::Instant::now();
+                let stored = with_native_vtable(*ppv, || library.store(library_name, pso));
+                crate::xlog_info!(
+                    "D3D12.X: compute PSO {library_name} ({} B DXIL) {} the pipeline library, {} ms",
+                    dxil.len(),
+                    if stored { "stored in" } else { "not stored in" },
+                    began.elapsed().as_millis()
+                );
+            }
+        }
     }
     (hr, in_driver, reused)
 }
